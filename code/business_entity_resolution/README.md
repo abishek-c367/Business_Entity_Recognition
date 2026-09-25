@@ -188,6 +188,10 @@ ANN results are unioned, remain country-aware, and are deduplicated before
 matching. The resulting candidate set is written to `candidate_pairs.tsv` for
 recall measurement and debugging.
 
+To bound worst-case work from common ANN or token buckets, each ANN bucket and
+selective block-key lookup contributes at most 500 rows. Exact name and address
+lookups remain uncapped.
+
 ### 4. Conservative matching
 
 Each candidate receives a simple score based on:
@@ -289,6 +293,11 @@ python code/business_entity_resolution/src/evaluate.py \
 For meaningful threshold selection, use a deterministic held-out subset of the
 training Source-1 entities. Do not tune a threshold on the same labels used to
 report the final validation score.
+
+The blocking recall diagnostic caches candidates once before sweeping multiple
+thresholds. On Linux, pass `--workers 8` to score thresholds in parallel after
+candidate retrieval; this avoids repeating the SQLite/TF-IDF retrieval work for
+each threshold.
 
 ## Running test inference
 

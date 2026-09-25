@@ -38,7 +38,8 @@ CHAR_NGRAM_MIN = 3
 CHAR_NGRAM_MAX = 5
 MINHASH_SIZE = 16
 LSH_BANDS = 4
-ANN_BUCKET_LIMIT = 2_000
+ANN_BUCKET_LIMIT = 500
+BLOCK_KEY_LIMIT = 500
 
 
 def normalize_text(value: str) -> str:
@@ -229,7 +230,7 @@ def build_index(source_paths: Iterable[Path], database_path: Path) -> None:
         for source_path in source_paths:
             rows = []
             ngram_counts: defaultdict[str, int] = defaultdict(int)
-            source = source_path.name.split("_")[1]
+            source = source_path.stem.split("_", 1)[1]
             for row in iter_rows(source_path):
                 name_key = normalize_name(row["business_name"])
                 address_key = normalize_address(row["business_address"])
@@ -399,8 +400,9 @@ def candidate_rows(
             "SELECT r.entity_id, r.business_name, r.business_address, "
             "r.country, r.source FROM block_keys b JOIN records r "
             "ON r.entity_id = b.entity_id WHERE b.block_key = ? "
-            "AND b.source IN ('source2', 'source3') AND r.country = ?",
-            (key, country),
+            "AND b.source IN ('source2', 'source3') AND r.country = "
+            "? ORDER BY b.entity_id LIMIT ?",
+            (key, country, BLOCK_KEY_LIMIT),
         ):
             candidates[candidate[0]] = candidate
     return [
