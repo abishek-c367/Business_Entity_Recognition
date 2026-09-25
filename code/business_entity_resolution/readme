@@ -1,0 +1,137 @@
+# Business Entity Resolution
+
+This project matches businesses from **Source 1** with the corresponding businesses in **Source 2 and Source 3**.
+
+The pipeline has two main steps:
+
+1. **Build a searchable index** of Source 2 and Source 3.
+2. **Generate matches** for every Source 1 business using the index.
+
+---
+
+## 1. Build Target Index
+
+```bash
+python code/business_entity_resolution/src/entity_resolution.py build-index \
+  --source dataset/train/train_source2.tsv \
+  --source dataset/train/train_source3.tsv \
+  --database work/train_targets.sqlite
+```
+
+### Function
+
+This command prepares Source 2 and Source 3 for fast searching.
+
+It:
+
+* Reads the Source 2 and Source 3 business records.
+* Normalizes business names and addresses.
+* Creates searchable blocking/index keys.
+* Stores the processed records in a SQLite database.
+* Does **not** generate final matches.
+
+### Arguments
+
+| Argument      | Purpose                                   |
+| ------------- | ----------------------------------------- |
+| `build-index` | Creates the searchable target index       |
+| `--source`    | Input Source 2/Source 3 files             |
+| `--database`  | Location where the SQLite index is stored |
+
+Output:
+
+```text
+work/train_targets.sqlite
+```
+
+Think of this step as **building a searchable phone book of all businesses in Source 2 and Source 3**.
+
+---
+
+# 2. Match Source 1 Businesses
+
+```bash
+python code/business_entity_resolution/src/entity_resolution.py match \
+  --source1 dataset/train/train_source1.tsv \
+  --database work/train_targets.sqlite \
+  --output work/train_predictions.tsv \
+  --candidate work/train_candidates.tsv \
+  --threshold 0.88
+```
+
+### Function
+
+This command finds possible matches for every Source 1 business.
+
+For each Source 1 record, it:
+
+1. Searches the SQLite index.
+2. Generates a smaller set of **candidate businesses**.
+3. Compares names and addresses.
+4. Calculates a similarity score.
+5. Accepts candidates whose score is at least `0.88`.
+6. Allows zero, one, or multiple matches.
+7. Saves the final results.
+
+### Arguments
+
+| Argument           | Purpose                                             |
+| ------------------ | --------------------------------------------------- |
+| `match`            | Runs the entity matching process                    |
+| `--source1`        | Source 1 businesses to be matched                   |
+| `--database`       | SQLite index created in Step 1                      |
+| `--output`         | Final accepted matches                              |
+| `--candidate`      | All candidate pairs generated during matching       |
+| `--threshold 0.88` | Minimum similarity score required to accept a match |
+
+### Outputs
+
+#### Final predictions
+
+```text
+work/train_predictions.tsv
+```
+
+Contains the matches that passed the similarity threshold.
+
+#### Candidate pairs
+
+```text
+work/train_candidates.tsv
+```
+
+Contains the possible matches considered before final acceptance.
+
+---
+
+# Overall Flow
+
+```text
+Source 2 + Source 3
+        │
+        ▼
+   build-index
+        │
+        ▼
+train_targets.sqlite
+        │
+        │
+Source 1 ──────────────┐
+                       ▼
+                    match
+                       │
+              ┌────────┴────────┐
+              ▼                 ▼
+     candidate_pairs.tsv   predictions.tsv
+      (possible matches)   (accepted matches)
+```
+
+## Important
+
+The `0.88` threshold is a **starting value**, not necessarily the final optimal threshold. It should be tuned using validation data and the competition's **macro F0.5** metric.
+
+The pipeline does **not** force every Source 1 business to have a match. A business can have:
+
+* **0 matches** — no reliable match found
+* **1 match** — one reliable match
+* **multiple matches** — several Source 2/3 records represent the same business

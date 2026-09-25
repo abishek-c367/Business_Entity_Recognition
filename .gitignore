@@ -1,0 +1,30 @@
+# Challenge datasets and generated submission data
+/dataset/
+/work/
+/output/
+*.tsv
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environments and secrets
+.venv/
+.env
+.env.*
+!.env.example
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
