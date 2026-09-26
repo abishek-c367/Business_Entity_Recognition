@@ -1,0 +1,209 @@
+Blocking Recall Experiment
+==========================
+
+Objective
+---------
+Increase candidate-generation recall from approximately 0.957 to at least
+0.99 while keeping the candidate set bounded.
+
+Evaluation setup
+----------------
+The experiments used the blocking_recall_diagnostic.py script with:
+
+- 10,000 randomly sampled Source-1 records
+- Random seed: 42
+- Full ground-truth matches force-included for the sampled Source-1 records
+- 10,000 random distractor target records
+- Source 2 and Source 3 targets included in the sampled index
+- Candidate recall measured before final matching thresholding
+
+The diagnostic uses a sampled SQLite index and does not reuse
+work/train_targets.sqlite.
+
+Baseline
+--------
+The previous production configuration used:
+
+- ANN bucket limit: 500
+- Selective block-key limit: 500
+- Exact normalized name and address blocks
+- Compact name blocks
+- Name-token and numeric-address blocks
+- Four-band MinHash/LSH ANN retrieval
+- Character 3-5-gram TF-IDF similarity
+
+10,000-record baseline result:
+
+- Macro candidate recall: 0.9571
+- Micro candidate recall: 0.9582
+- Candidate-set mean for true-match entities: 173.30
+- Candidate-set median: 120
+- Candidate-set p95: 565
+- Candidate-set maximum: 1,191
+
+Observed failure pattern
+-----------------------
+The missed true matches frequently had substantially different business names,
+including transliterated names, domain-style names, or shortened names. Their
+addresses still shared informative words such as locality, street, person, or
+building names.
+
+Examples included:
+
+- "Life Investments Private Limited" versus a translated-script equivalent,
+  with the shared address locality "Patna"
+- "Housing Project" versus "housingproject.com", with the shared address
+  locality "Beechwood Avenue"
+- "Douglas and Clardy Associates" versus "clárdyassociates.com", with the
+  shared address token "Clay"
+
+Implemented changes
+-------------------
+
+1. Corrected source-tag parsing
+
+The index builder previously derived the source using:
+
+    source_path.name.split("_")[1]
+
+For train_source2.tsv, this produced source2.tsv instead of source2. ANN and
+selective block SQL queries filter for the bare values source2 and source3,
+so those retrieval mechanisms were silently disabled.
+
+The code now uses:
+
+    source_path.stem.split("_", 1)[1]
+
+Normal filenames now produce:
+
+    train_source2.tsv -> source2
+    train_source3.tsv -> source3
+
+2. Added informative address-word blocks
+
+block_keys() now selects up to six longest address tokens that:
+
+- have at least five characters
+- are not numeric
+
+Each selected token creates an address block key:
+
+    a:<address_word>
+
+This helps recover records whose names differ but whose addresses share
+informative locality or street/building words.
+
+3. Added address-pair blocks
+
+The code creates pairwise combinations among the six selected address words:
+
+    aa:<address_word_1>:<address_word_2>
+
+Pair keys are more selective than individual address-word keys and improve
+recall without requiring an unrestricted address-token lookup.
+
+4. Reduced broad retrieval limits
+
+The current limits are:
+
+    ANN_BUCKET_LIMIT = 100
+    BLOCK_KEY_LIMIT = 75
+
+These limits apply to ANN bucket and selective block-key retrieval. Exact
+normalized name and exact normalized address queries remain uncapped.
+
+5. Fixed threshold-sweep inefficiency
+
+The diagnostic now retrieves candidates once per Source-1 row, caches them, and
+then applies each threshold to the cached candidates. Previously, candidate
+retrieval was repeated for every threshold.
+
+Threshold scoring can use multiple processes with --workers, although the
+SQLite candidate retrieval stage remains primarily single-process.
+
+Experiment results
+------------------
+
+Address-word blocks with six words, ANN limit 100, and block limit 75:
+
+- Macro candidate recall: 0.9874
+- Micro candidate recall: 0.9876
+- Candidate-set mean: 176.57
+- Candidate-set median: 168
+- Candidate-set p95: 353
+- Candidate-set maximum: 731
+
+Address-pair blocks using six address words, ANN limit 100, and block limit 75:
+
+- Macro candidate recall: 0.9905
+- Micro candidate recall: 0.9905
+- Candidate-set mean: 220.13
+- Candidate-set median: 193
+- Candidate-set p95: 466
+- Candidate-set maximum: 871
+
+This was the selected configuration because it exceeded the 0.99 target on the
+deterministic 10,000-record experiment while keeping candidate sets bounded.
+
+Alternative trade-off tested:
+
+Reducing the block limit to 50 lowered the candidate-set mean to 166.55, but
+macro recall fell to 0.9869. Therefore, the limit of 75 was retained.
+
+Smoke test
+----------
+A 20-record smoke test using the selected configuration produced:
+
+- Macro candidate recall: 1.0000
+- Micro candidate recall: 1.0000
+- Candidate-set mean for matched entities: 4.88
+
+Files changed
+-------------
+
+- code/business_entity_resolution/src/entity_resolution.py
+  - Correct source-tag parsing
+  - Address-word and address-pair blocking
+  - ANN and selective-block limits
+
+- code/business_entity_resolution/src/blocking_recall_diagnostic.py
+  - Production-only diagnostic path
+  - Candidate caching for threshold sweeps
+  - Optional parallel threshold scoring
+
+- code/business_entity_resolution/README.md
+  - Documentation of the new blocks, limits, and measured experiment results
+
+Rebuilding indexes
+------------------
+
+The diagnostic creates its own sampled index and does not require
+work/train_targets.sqlite to exist.
+
+For normal matching, rebuild the production index after changing blocking
+logic:
+
+    python code/business_entity_resolution/src/entity_resolution.py build-index \
+      --source dataset/train/train_source2.tsv \
+      --source dataset/train/train_source3.tsv \
+      --database work/train_targets.sqlite
+
+Then run the 10,000-record diagnostic with:
+
+    python code/business_entity_resolution/src/blocking_recall_diagnostic.py \
+      --student-resource-dir "$PWD" \
+      --work-dir work/diagnostic_10k_addresspairs \
+      --source1-sample-size 100000 \
+      --target-fill-size 100000 \
+      --seed 42 \
+      --skip-threshold-sweep \
+      --workers 8 \
+      --progress-every 10000
+
+Limitations
+-----------
+
+The 0.9905 result is measured on the deterministic 10,000-record sample. It is
+not a mathematical guarantee for the full training corpus or test corpus.
+A larger held-out sample or full-corpus validation should be run before final
+threshold selection and submission.
