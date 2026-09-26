@@ -1,3 +1,27 @@
+SUPERSEDED -- 2026-09-26
+=======================
+This file documents the blocking design that was replaced on 2026-09-26 and is
+kept only as a record of what was measured at the time. Do not use its numbers
+or settings as a description of the current pipeline.
+
+Two things in it are misleading if read as current:
+
+  * The headline recall figures (0.9571 baseline / 0.9905 with the address-pair
+    extension) come from a pool in which every true target was force-included.
+    That pool is roughly 78% answers to a sampled query, so it measures
+    reachability under ideal conditions, not recall at realistic density. On a
+    realistic-density pool (1M records, answer density 5.6%) the same family of
+    design measured 0.9542 macro recall at a median candidate set of 489.
+  * The retrieval design described below -- per-key capped exact/selective token
+    blocks, character n-gram TF-IDF, and 16-hash MinHash LSH bands -- no longer
+    exists. It was replaced by a single IDF-weighted ranked postings lookup.
+
+Current design, measured numbers, and the shipped threshold are in
+code/business_entity_resolution/README.md. The current realistic-pool result is
+macro candidate recall 0.9743 at a median candidate set of 300.
+
+--------------------------------------------------------------------------
+
 Blocking Recall Experiment
 ==========================
 

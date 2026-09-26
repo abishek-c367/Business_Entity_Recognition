@@ -28,29 +28,38 @@ Instead this script:
   3. Fills the remaining target budget (`--target-fill-size`, default
      100,000 total, split across Source 2 / Source 3 by their relative
      sizes) with randomly sampled DISTRACTOR records, so the candidate
-     generator still has to do real work (block collisions, ANN buckets
-     with unrelated neighbours, etc.) rather than being handed only the
-     answers.
+     generator still has to do real work (term collisions with unrelated
+     neighbours, etc.) rather than being handed only the answers.
 
 --------------------------------------------------------------------------
-SOURCE-TAG AND CANDIDATE-SIZE DIAGNOSTICS
+MECHANISM ATTRIBUTION AND MISS REASONS
 --------------------------------------------------------------------------
-The current entity_resolution.py build_index() tags every indexed record with:
+Retrieval is `entity_resolution.candidate_rows`: an IDF-weighted ranked
+postings lookup bounded by POSTINGS_BUDGET, cut to CANDIDATE_LIMIT, with
+exact-address matches seeded so the cut can never drop one. So "which
+mechanism found this candidate" is now a small question with three answers --
+shared indexed term, exact address, exact name -- and the interesting
+diagnostic is no longer the breakdown but the *residual*: for a link that was
+NOT retrieved, why not?
 
-    source = source_path.stem.split("_", 1)[1]
+`diagnose_misses` answers that per missed target:
+  - target_not_in_sampled_index -- outside the sampled pool entirely;
+  - country_mismatch             -- postings are country-scoped, so unreachable;
+  - beyond_rank_cut              -- shares a chosen term but ranked past
+                                    CANDIDATE_LIMIT; the cut is too tight;
+  - postings_budget_dropped      -- shares only terms that query_terms dropped
+                                    for exceeding POSTINGS_BUDGET; the budget is
+                                    too tight for this query;
+  - no_shared_term               -- shares nothing the index kept. Lexically
+                                    unreachable: transliteration or mid-word
+                                    typos, fixable only by a fuzzy retriever.
 
-This makes the normal train_source2.tsv and train_source3.tsv filenames
-compatible with the ANN/LSH and selective block-key source filters. Each
-selective block and ANN bucket is also capped to bound candidate-set size.
+The two middle reasons are the ones a configuration change can actually fix,
+which is what makes them worth separating from the rest.
 
 This script builds an index over the sampled data and reports:
   - candidate recall overall and by retrieval mechanism;
   - candidate-set size distributions for matched and singleton entities.
-
-It then reports candidate recall under both indexes side by side, plus a
-per-mechanism breakdown (exact name / exact compact name / exact address /
-ANN-LSH / selective block key) so you can see exactly how much each
-mechanism is (or, currently, isn't) contributing.
 
 --------------------------------------------------------------------------
 WHAT IT MEASURES
@@ -112,6 +121,13 @@ from typing import Dict, Iterable, List, Set, Tuple
 SOURCE_HEADER = ("entity_id", "business_name", "business_address", "country")
 GT_HEADER = ("source1_entity_id", "matched_entity_ids")
 
+# Sweep the region the shipped scorer actually lives in (DEFAULT_THRESHOLD is
+# 0.70) and carry 0.88 as the historical reference point, since the previous
+# release shipped it. With the always-best-candidate rule the curve is flat
+# from ~0.5 to ~0.7, so the low end is cheap to include and makes that
+# flatness visible rather than asserted.
+_DEFAULT_THRESHOLDS = [0.5, 0.6, 0.65, 0.70, 0.75, 0.80, 0.85, 0.88, 0.95]
+
 _SWEEP_CONTEXT = None
 
 
@@ -162,10 +178,13 @@ def _recall_chunk(chunk: List[Tuple[dict, str]]) -> List[dict]:
             mechanisms = attributed_candidates(er, connection, row)
             combined = set(mechanisms)
             hit = combined & true_set
-            group_hit = {}
-            for group, tags in MECHANISM_GROUPS.items():
-                group_candidates = {eid for eid, m in mechanisms.items() if m & tags}
-                group_hit[group] = bool(group_candidates & true_set)
+            # Derived from MECHANISM_GROUPS, not spelled out, so a change to
+            # the retrieval design cannot leave this reporting stale group
+            # names that always come back False.
+            group_hit = {
+                group: bool({eid for eid, m in mechanisms.items() if m & tags} & true_set)
+                for group, tags in MECHANISM_GROUPS.items()
+            } if true_set else {group: False for group in MECHANISM_GROUPS}
             results.append({
                 "sid": sid,
                 "true_count": len(true_set),
@@ -175,10 +194,8 @@ def _recall_chunk(chunk: List[Tuple[dict, str]]) -> List[dict]:
                 # true_set is small (a handful of ids at most), so this stays
                 # cheap to pickle even though `combined` can be large.
                 "missed_ids": sorted(true_set - combined),
+                "group_hit": group_hit,
                 "group_hit_combined": bool(hit) if true_set else False,
-                "group_hit_exact_any": group_hit["exact_any"] if true_set else False,
-                "group_hit_ann_lsh": group_hit["ann_lsh"] if true_set else False,
-                "group_hit_selective_block_key": group_hit["selective_block_key"] if true_set else False,
             })
         return results
     finally:
@@ -216,72 +233,53 @@ def run_recall_pass(
 def diagnose_misses(
     er, db_path: Path, miss_rows: List[Tuple[dict, str, List[str]]],
 ) -> List[dict]:
-    """miss_rows: list of (source1_row, source1_id, missed_target_ids)."""
-    connection = sqlite3.connect(db_path)
+    """Attribute each missed link to the step that lost it.
+
+    miss_rows: list of (source1_row, source1_id, missed_target_ids).
+
+    One `_ranked_candidates` call per row answers the whole row, so this stays
+    proportional to the number of misses rather than to the number of pairs.
+    """
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     diagnoses = []
     for row, sid, missed_ids in miss_rows:
-        name_key = er.normalize_name(row["business_name"])
-        address_key = er.normalize_address(row["business_address"])
-        query_search_key = er.search_text(name_key, address_key)
-        query_ngrams = er.character_ngrams(query_search_key)
-        query_buckets = set(er.ann_bucket_keys(er.minhash_signature(query_ngrams)))
-        query_block_keys = set(er.block_keys(name_key, address_key))
+        _survivors, cut_ids, dropped_sharers = _ranked_candidates(er, connection, row)
+        cut = set(cut_ids)
 
         for target_id in missed_ids:
             target = connection.execute(
-                "SELECT business_name, business_address, country, source "
-                "FROM records WHERE entity_id = ?",
+                "SELECT country FROM records WHERE entity_id = ?",
                 (target_id,),
             ).fetchone()
             if target is None:
                 diagnoses.append({
                     "source1_entity_id": sid, "missed_target_id": target_id,
                     "reason": "target_not_in_sampled_index",
-                    "country_mismatch": "", "ann_bucket_truncated": "",
-                    "block_key_truncated": "",
+                    "country_mismatch": "", "beyond_rank_cut": "",
+                    "postings_budget_dropped": "",
                 })
                 continue
-            target_name, target_address, target_country, target_source = target
-
+            (target_country,) = target
             country_mismatch = row["country"] != target_country
-
-            # Was this target actually IN one of the query's LSH buckets,
-            # just excluded by the ANN_BUCKET_LIMIT cap on the query side?
-            ann_truncated = False
-            if not country_mismatch and query_buckets:
-                placeholders = ",".join("?" for _ in query_buckets)
-                found = connection.execute(
-                    f"SELECT 1 FROM ann_buckets WHERE entity_id = ? "
-                    f"AND bucket_key IN ({placeholders}) LIMIT 1",
-                    (target_id, *query_buckets),
-                ).fetchone()
-                ann_truncated = bool(found)
-
-            # Same check for selective block keys.
-            block_key_truncated = False
-            if not country_mismatch and query_block_keys:
-                placeholders = ",".join("?" for _ in query_block_keys)
-                found = connection.execute(
-                    f"SELECT 1 FROM block_keys WHERE entity_id = ? "
-                    f"AND block_key IN ({placeholders}) LIMIT 1",
-                    (target_id, *query_block_keys),
-                ).fetchone()
-                block_key_truncated = bool(found)
+            beyond_cut = target_id in cut
+            budget_dropped = target_id in dropped_sharers
 
             if country_mismatch:
                 reason = "country_mismatch"
-            elif ann_truncated or block_key_truncated:
-                reason = "truncated_by_limit"
+            elif beyond_cut:
+                reason = "beyond_rank_cut"
+            elif budget_dropped:
+                reason = "postings_budget_dropped"
             else:
-                reason = "no_mechanism_overlap"
+                reason = "no_shared_term"
 
             diagnoses.append({
                 "source1_entity_id": sid,
                 "missed_target_id": target_id,
                 "reason": reason,
                 "country_mismatch": country_mismatch,
-                "ann_bucket_truncated": ann_truncated,
-                "block_key_truncated": block_key_truncated,
+                "beyond_rank_cut": beyond_cut,
+                "postings_budget_dropped": budget_dropped,
             })
     connection.close()
     return diagnoses
@@ -418,71 +416,101 @@ def summarize_sizes(values: List[int]) -> str:
 
 
 # --------------------------------------------------------------------------
-# Attributed candidate retrieval -- mirrors entity_resolution.candidate_rows
-# exactly (same SQL, same source filter, including its current bug), but
-# tags each candidate with WHICH mechanism found it, and can be pointed at
-# the production database.
+# Attributed candidate retrieval.
+#
+# `_ranked_candidates` mirrors entity_resolution.candidate_rows step for step
+# -- same term selection, same SQL, same ranking key and cut -- and then adds
+# what the diagnostic needs on top: which mechanism found each survivor, which
+# targets were ranked past the cut, and which were never ranked at all because
+# their only shared terms were dropped by the postings budget. Those last two
+# are exactly the populations a configuration change can move, so the
+# diagnostic has to be able to tell them apart.
 # --------------------------------------------------------------------------
 
-def attributed_candidates(er, connection: sqlite3.Connection, row: dict) -> Dict[str, Set[str]]:
+def _ranked_candidates(er, connection: sqlite3.Connection, row: dict):
+    """Return (survivors, cut_ids, dropped_sharers) for one Source-1 row.
+
+    survivors      -- {entity_id: {mechanism, ...}}, exactly the records
+                      candidate_rows would return.
+    cut_ids        -- ranked past CANDIDATE_LIMIT, i.e. reachable but cut.
+    dropped_sharers -- share only terms query_terms dropped for exceeding
+                      POSTINGS_BUDGET, so they never even entered the ranking.
+    """
     name_key = er.normalize_name(row["business_name"])
     address_key = er.normalize_address(row["business_address"])
     country = row["country"]
-    query_search_key = er.search_text(name_key, address_key)
-    query_ngrams = er.character_ngrams(query_search_key)
-    query_buckets = er.ann_bucket_keys(er.minhash_signature(query_ngrams))
 
+    all_terms = er.index_terms(name_key, address_key)
+    chosen = set(er.query_terms(connection, country, all_terms))
+    dropped = all_terms - chosen
+
+    evidence: Dict[str, float] = defaultdict(float)
     mechanisms: Dict[str, Set[str]] = defaultdict(set)
 
-    if name_key:
-        for (eid,) in connection.execute(
-            "SELECT entity_id FROM records WHERE country = ? AND name_key = ?",
-            (country, name_key),
+    if chosen:
+        placeholders = ",".join("?" for _ in chosen)
+        for entity_id, weight in connection.execute(
+            "SELECT p.entity_id, SUM(s.weight) FROM postings p "
+            "JOIN term_stats s ON s.term = p.term AND s.country = p.country "
+            f"WHERE p.country = ? AND p.term IN ({placeholders}) "
+            "GROUP BY p.entity_id",
+            (country, *chosen),
         ):
-            mechanisms[eid].add("exact_name")
-        for (eid,) in connection.execute(
-            "SELECT entity_id FROM records WHERE country = ? AND name_compact = ?",
-            (country, er.compact_key(name_key)),
-        ):
-            mechanisms[eid].add("exact_name_compact")
+            evidence[entity_id] = weight
+            mechanisms[entity_id].add("term_overlap")
+
+    # Same seed as production. An exact address is the most precise evidence in
+    # the pipeline (P=0.910), so it is lifted above any ordinary term sum and
+    # cannot be lost to the ranked cut.
     if address_key:
-        for (eid,) in connection.execute(
+        for (entity_id,) in connection.execute(
             "SELECT entity_id FROM records WHERE country = ? AND address_key = ?",
             (country, address_key),
         ):
-            mechanisms[eid].add("exact_address")
-    ann_limit = er.adaptive_limit(
-        er.ANN_BUCKET_LIMIT, len(query_buckets), er.ANN_BUCKET_MIN_LIMIT
-    )
-    for bucket in query_buckets:
-        for (eid,) in connection.execute(
-            "SELECT r.entity_id FROM ann_buckets b JOIN records r "
-            "ON r.entity_id = b.entity_id WHERE b.bucket_key = ? "
-            "AND b.source IN ('source2', 'source3') AND r.country = ? "
-            "ORDER BY b.entity_id LIMIT ?",
-            (bucket, country, ann_limit),
+            evidence[entity_id] += er.EXACT_ADDRESS_SEED
+            mechanisms[entity_id].add("exact_address")
+
+    # Attribution only -- candidate_rows does not seed exact names, they are
+    # reached through their indexed tokens. This still earns its place because
+    # a name whose every token is shorter than MIN_TERM_LENGTH, or consists
+    # only of pruned stopwords, matches exactly yet shares no surviving term.
+    if name_key:
+        for (entity_id,) in connection.execute(
+            "SELECT entity_id FROM records WHERE country = ? AND name_key = ?",
+            (country, name_key),
         ):
-            mechanisms[eid].add("ann_lsh")
-    query_block_keys = er.block_keys(name_key, address_key)
-    block_limit = er.adaptive_limit(
-        er.BLOCK_KEY_LIMIT, len(query_block_keys), er.BLOCK_KEY_MIN_LIMIT
-    )
-    for key in query_block_keys:
-        for (eid,) in connection.execute(
-            "SELECT r.entity_id FROM block_keys b JOIN records r "
-            "ON r.entity_id = b.entity_id WHERE b.block_key = ? "
-            "AND b.source IN ('source2', 'source3') AND r.country = "
-            "? ORDER BY b.entity_id LIMIT ?",
-            (key, country, block_limit),
-        ):
-            mechanisms[eid].add("selective_block_key")
-    return mechanisms
+            mechanisms[entity_id].add("exact_name")
+
+    ranked = sorted(evidence.items(), key=lambda item: (-item[1], item[0]))
+    cut_ids = [entity_id for entity_id, _w in ranked[er.CANDIDATE_LIMIT:]]
+    survivors = {entity_id: mechanisms[entity_id] for entity_id, _w in ranked[:er.CANDIDATE_LIMIT]}
+
+    dropped_sharers: Set[str] = set()
+    if dropped:
+        placeholders = ",".join("?" for _ in dropped)
+        dropped_sharers = {
+            entity_id for (entity_id,) in connection.execute(
+                f"SELECT DISTINCT entity_id FROM postings "
+                f"WHERE country = ? AND term IN ({placeholders})",
+                (country, *dropped),
+            )
+        }
+    return survivors, cut_ids, dropped_sharers
 
 
+def attributed_candidates(er, connection: sqlite3.Connection, row: dict) -> Dict[str, Set[str]]:
+    survivors, _cut_ids, _dropped_sharers = _ranked_candidates(er, connection, row)
+    return survivors
+
+
+# Attribute groups are resolved by iterating this mapping, never by naming the
+# groups again at the call sites -- an earlier version hardcoded the group
+# names in _recall_chunk and silently stopped reporting the moment the
+# retrieval design changed. Adding a mechanism here is now the only edit.
 MECHANISM_GROUPS = {
-    "exact_any": {"exact_name", "exact_name_compact", "exact_address"},
-    "ann_lsh": {"ann_lsh"},
-    "selective_block_key": {"selective_block_key"},
+    "exact_address": {"exact_address"},
+    "exact_name": {"exact_name"},
+    "term_overlap": {"term_overlap"},
 }
 
 
@@ -565,12 +593,9 @@ def run_index_variant(
             micro_true_total += true_count
             if result["group_hit_combined"]:
                 group_recall_hits["combined"] += 1
-            if result["group_hit_exact_any"]:
-                group_recall_hits["exact_any"] += 1
-            if result["group_hit_ann_lsh"]:
-                group_recall_hits["ann_lsh"] += 1
-            if result["group_hit_selective_block_key"]:
-                group_recall_hits["selective_block_key"] += 1
+            for group in MECHANISM_GROUPS:
+                if result["group_hit"][group]:
+                    group_recall_hits[group] += 1
 
             if hit_count == 0:
                 n_zero_hit += 1
@@ -609,7 +634,7 @@ def run_index_variant(
         with diag_csv_path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=[
                 "source1_entity_id", "missed_target_id", "reason",
-                "country_mismatch", "ann_bucket_truncated", "block_key_truncated",
+                "country_mismatch", "beyond_rank_cut", "postings_budget_dropped",
             ])
             writer.writeheader()
             writer.writerows(diagnoses)
@@ -623,9 +648,10 @@ def run_index_variant(
         "macro_candidate_recall": macro_recall,
         "micro_candidate_recall": micro_recall,
         "entities_with_any_hit_combined": group_recall_hits["combined"],
-        "entities_with_any_hit_exact_any": group_recall_hits["exact_any"],
-        "entities_with_any_hit_ann_lsh": group_recall_hits["ann_lsh"],
-        "entities_with_any_hit_selective_block_key": group_recall_hits["selective_block_key"],
+        **{
+            f"entities_with_any_hit_{group}": group_recall_hits[group]
+            for group in MECHANISM_GROUPS
+        },
         "candidate_size_matched": summarize_sizes(candidate_sizes_matched),
         "candidate_size_singleton": summarize_sizes(candidate_sizes_singleton),
         "n_zero_hit": n_zero_hit,
@@ -709,7 +735,7 @@ def _run_diagnostic() -> None:
                               "of this budget, never counted against it.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--thresholds", type=float, nargs="+",
-                         default=[0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.88, 0.9, 0.95])
+                         default=list(_DEFAULT_THRESHOLDS))
     parser.add_argument("--progress-every", type=int, default=10_000)
     parser.add_argument("--workers", type=int, default=1,
                          help="Processes used for BOTH the recall pass "
@@ -717,10 +743,11 @@ def _run_diagnostic() -> None:
                               "threshold-sweep scoring after candidate "
                               "retrieval is cached (Linux supports fork).")
     parser.add_argument("--skip-miss-diagnosis", action="store_true",
-                         help="Skip the per-miss country-mismatch / ANN-truncation "
-                              "/ block-key-truncation breakdown (recall numbers are "
-                              "unaffected either way -- this only skips the extra "
-                              "root-cause queries for the misses).")
+                         help="Skip the per-miss root-cause breakdown "
+                              "(country-mismatch / beyond-rank-cut / "
+                              "postings-budget-dropped / no-shared-term). Recall "
+                              "numbers are unaffected either way -- this only skips "
+                              "the extra re-ranking queries for the misses.")
     parser.add_argument("--skip-threshold-sweep", action="store_true",
                          help="Only measure candidate recall; skip the "
                               "precision/recall/F0.5 threshold sweep (much faster).")
@@ -737,8 +764,8 @@ def _run_diagnostic() -> None:
             args.source1_sample_size = 2_000
         if args.target_fill_size == 100_000:
             args.target_fill_size = 2_000
-        if args.thresholds == [0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.88, 0.9, 0.95]:
-            args.thresholds = [0.88]
+        if args.thresholds == _DEFAULT_THRESHOLDS:
+            args.thresholds = [0.70]  # the shipped default
 
     src_dir = args.src_dir or (
         args.student_resource_dir / "code" / "business_entity_resolution" / "src"
@@ -822,12 +849,10 @@ def _run_diagnostic() -> None:
         print(f"  micro candidate recall : {result['micro_candidate_recall']:.4f}")
         print(f"  entities w/ >=1 hit, combined            : "
               f"{result['entities_with_any_hit_combined']:,} / {result['matched_entity_count']:,}")
-        print(f"  entities w/ >=1 hit, exact matching only  : "
-              f"{result['entities_with_any_hit_exact_any']:,} / {result['matched_entity_count']:,}")
-        print(f"  entities w/ >=1 hit, ANN/LSH only         : "
-              f"{result['entities_with_any_hit_ann_lsh']:,} / {result['matched_entity_count']:,}")
-        print(f"  entities w/ >=1 hit, selective block key  : "
-              f"{result['entities_with_any_hit_selective_block_key']:,} / {result['matched_entity_count']:,}")
+        for group in MECHANISM_GROUPS:
+            print(f"  entities w/ >=1 hit, via {group:<17}: "
+                  f"{result[f'entities_with_any_hit_{group}']:,} / "
+                  f"{result['matched_entity_count']:,}")
         print(f"  candidate-set size (true-match entities)  : {result['candidate_size_matched']}")
         print(f"  candidate-set size (true singletons)      : {result['candidate_size_singleton']}")
         print(f"  entities with FULL hit (all true matches found)    : {result['n_full_hit']:,}")

@@ -160,66 +160,95 @@ and Source 3 records. It stores:
 - original entity ID and source;
 - original business name and address;
 - country;
-- normalized name and address;
-- compact normalized forms;
-- selective token block keys.
+- normalized name and address.
+
+Alongside `records`, two tables carry the inverted index:
+
+- `postings(term, country, entity_id)` -- one row per (term, record), where a
+  term is `n:<token>` or `a:<token>` for every normalized name or address
+  token of length >= 2;
+- `term_stats(term, country, document_frequency, weight)`, where
+  `weight = log(1 + N_country / df)`.
 
 SQLite is used so the full candidate sources do not have to be loaded into
 Python memory at once.
 
 ### 3. Candidate generation
 
-For each Source-1 record, candidates are collected using multiple country-aware
-blocking rules:
+Candidates come from a single IDF-weighted ranked lookup rather than a union of
+many independently capped blocking rules. For each Source-1 record:
 
-- exact normalized business name;
-- exact normalized address;
-- compact normalized name;
-- selective name-token keys;
-- numeric address-token keys;
-- a combined name/address block key when available.
+1. Every token of the normalized name and address is turned into an index term.
+   Terms whose document frequency exceeds 0.5% of the country's records are
+   dropped as stopwords -- the cap is a *fraction* so it stays meaningful as
+   the corpus grows.
+2. The surviving terms are taken rarest-first until the cumulative posting
+   count reaches `POSTINGS_BUDGET` (20,000). This is the scale-invariance
+   mechanism: it bounds work per query by a constant instead of letting it grow
+   with the corpus, and taking the rarest first guarantees the most
+   discriminative shared term is always used.
+3. One grouped query sums `term_stats.weight` per candidate record and orders
+   by that evidence; the top `CANDIDATE_LIMIT` (300) survive.
+4. Exact normalized address matches are seeded with a weight no ordinary term
+   sum reaches, so the ranked cut can never discard the single most precise
+   signal in the pipeline (measured precision 0.910).
 
-The index also stores boundary-padded character 3- to 5-grams for the
-normalized name and address. Corpus document frequencies provide TF-IDF
-cosine similarity, and bottom-k MinHash signatures (16 hashes) are divided
-into four LSH bands. Matching LSH buckets provide an approximate-nearest-neighbor
-candidate set without loading the target corpus into memory. Exact blocks and
-ANN results are unioned, remain country-aware, and are deduplicated before
-matching. The resulting candidate set is written to `candidate_pairs.tsv` for
-recall measurement and debugging.
+Bounding the *ranked* list -- rather than each of ~25 keys separately -- is what
+makes the candidate set both small and high-recall. A true link sharing one rare
+term outranks thousands of records sharing several common ones, so it survives
+the cut; under the previous per-key caps it was dropped by whichever cap it
+happened to land under. The candidate set is written to `candidate_pairs.tsv`
+for recall measurement and debugging.
 
-To improve recall for transliterated or domain-style business names, blocking
-also indexes the six longest informative address words and their pairwise
-combinations. This catches records whose names differ substantially while
-their addresses still overlap. To bound worst-case work from common ANN or
-token buckets, the query-time budgets are distributed across the ANN buckets
-and selective block keys for each query row. Each retrieval keeps a minimum
-floor of 25 candidates per bucket/key to protect recall for sparse keys.
-Exact name and address lookups remain uncapped.
+On a realistic-density sample (1M-record pool, 8,000 Source-1 rows, 9,363 true
+links, answer density 5.6% rather than a force-included pool), this reaches
+**macro candidate recall 0.9743 at a median candidate set of 300**, versus
+0.9542 at a median of 489 for the previous design, at 15.4 ms/row instead of
+103.7. A diagnostic setting that force-includes every true target measures
+0.9979 recall, but that pool is ~78% answers and is optimistic by construction
+-- quote the realistic figure.
 
-On a deterministic 10,000-entity training sample, this address-pair extension
-increased macro candidate recall from 0.9571 to 0.9905. The same experiment
-had a median candidate set of 193 and a 95th percentile of 466, so these are
-recall/size validation results rather than a guarantee for every full-corpus
-entity.
+Names in Indic scripts are transliterated to Latin (ISCII-91 offset tables over
+the Brahmic blocks, with schwa deletion and vowel-run collapsing) before
+normalization, so `बॉम्बे एस्टेट` indexes as `bombe estet` rather than
+vanishing. Without this, 6.9% of Indian records had an empty normalized name
+and were unreachable by name at all.
 
 ### 4. Conservative matching
 
-Each candidate receives a simple score based on:
+Each candidate is scored by one deliberately simple rule: the equally weighted
+mean of the name-token Jaccard similarity and the address-token Jaccard
+similarity.
 
-- exact normalized name agreement;
-- exact normalized address agreement;
-- normalized name token Jaccard similarity;
-- normalized address token Jaccard similarity;
-- a weighted combination of name and address similarity.
+The address carries as much weight as the name because it is *more*
+discriminative: the most common normalized address key in the 1M-record corpus
+is shared by 6 records, and none reach the stopword cap, whereas 38% of records
+share an exact normalized name. Every elaboration tried on top of the plain
+blend measured worse under macro F0.5 -- discounting exact names by document
+frequency (0.8326 vs 0.8434), boosting an exact address to 0.95 (+0.0005, i.e.
+noise), and weighting the name 0.65 over the address as the previous release did
+(0.7922).
 
-Candidates above the configured threshold are written to
-`matching_results.tsv`. Matching is independent rather than one-to-one, so
-valid one-to-many relationships are preserved.
+Two parts make up the prediction set:
 
-The default threshold is `0.88`. It is intentionally exposed as a command-line
-argument and should be tuned using held-out training data before final test
-inference.
+- every candidate scoring at or above `--threshold` (default **0.70**);
+- plus the single best candidate whenever it clears `MIN_EVIDENCE` (0.30).
+
+The second part is not a heuristic flourish but a consequence of the metric.
+`entity_f05` scores an empty prediction against non-empty gold as 0.0 --
+identical to a single wrong prediction -- and 94.4% of real Source-1 rows have at
+least one match. So on any such row, emitting one's best candidate weakly
+dominates emitting nothing; a pure threshold rule was leaving macro F0.5 on the
+table. That alone lifts matched-row macro F0.5 from 0.7922 to 0.8434.
+`MIN_EVIDENCE` is what gives the behaviour back on the 5.58% of rows that are
+genuinely matchless and must stay silent; the floor was swept against the real
+corpus mix and is flat between 0.20 and 0.40.
+
+Predictions are written to `matching_results.tsv`. Matching is independent
+rather than one-to-one, so valid one-to-many relationships are preserved.
+
+The threshold is exposed as a command-line argument and should be re-tuned on
+held-out training data if the corpus or the scoring rule changes.
 
 ## Source files
 
@@ -227,11 +256,12 @@ inference.
 
 Main pipeline implementation. It provides:
 
-- `normalize_text`
-- `normalize_name`
-- `normalize_address`
-- `block_keys`
+- `normalize_text` / `normalize_name` / `normalize_address`
+- `transliterate`
+- `index_terms` / `query_terms`
 - `build_index`
+- `candidate_rows`
+- `match_score` / `select_matches`
 - `run_matching`
 
 It has two command-line modes:
@@ -282,7 +312,10 @@ python code/business_entity_resolution/src/entity_resolution.py build-index \
   --database work/train_targets.sqlite
 ```
 
-Generate baseline predictions and candidates for the training Source-1 file:
+Generate predictions and candidates. `--workers` defaults to 4 and only affects
+speed -- the outputs are byte-identical for any value, so a rerun with a
+different worker count reproduces the same submission. Capping it at 4 keeps the
+pipeline polite on a shared host; the index build itself is single-threaded:
 
 ```bash
 python code/business_entity_resolution/src/entity_resolution.py match \
@@ -290,7 +323,7 @@ python code/business_entity_resolution/src/entity_resolution.py match \
   --database work/train_targets.sqlite \
   --output work/train_predictions.tsv \
   --candidate work/train_candidates.tsv \
-  --threshold 0.88
+  --threshold 0.70
 ```
 
 Evaluate the predictions:
@@ -332,7 +365,7 @@ python code/business_entity_resolution/src/entity_resolution.py match \
   --database work/test_targets.sqlite \
   --output output/matching_results.tsv \
   --candidate output/candidate_pairs.tsv \
-  --threshold 0.88
+  --threshold 0.70
 ```
 
 The output files have the required headers:
@@ -388,47 +421,69 @@ The validator checks:
 - Profiled the full training schema, missingness, country distribution, and
   ground-truth match cardinalities.
 - Added a macro F0.5 evaluator matching the challenge metric.
-- Implemented Unicode, name, and address normalization.
-- Implemented a disk-backed SQLite target index.
-- Implemented exact and selective token blocking.
-- Implemented conservative pair scoring.
+- Implemented Unicode, name, and address normalization, including
+  transliteration of Indic scripts.
+- Replaced the capped multi-rule blocking design with a single IDF-weighted
+  ranked postings lookup (`postings` / `term_stats`).
+- Retuned the scorer against macro F0.5 rather than pooled precision/recall,
+  and added the always-emit-best-candidate rule the metric rewards.
+- Parallelised the retrieval pass; verified byte-identical output across
+  worker counts.
 - Implemented required matching and candidate output formats.
-- Verified Python syntax and editor diagnostics.
 - Verified the pipeline with a small end-to-end smoke test.
-- Measured the limitations of exact normalized blocking on a training sample.
+
+### Measured on a realistic-density sample
+
+Pool: 1,000,000 target records, 8,000 Source-1 rows, 9,363 true links, answer
+density 5.6% (no true target force-included).
+
+| Metric | Previous design | Current |
+|---|---|---|
+| Macro candidate recall | 0.9542 | **0.9743** |
+| Median candidate set | 489 | **300** |
+| Retrieval | 103.7 ms/row | **11.6 ms/row** |
+| Macro F0.5 (matched rows) | 0.6356 | **0.8479** |
+| micro precision / recall | 0.221 / 0.870 | **0.889 / 0.783** |
+| Mean predictions per row | 4.60 | **1.03** |
+
+Projected macro F0.5 over the real corpus mix (94.42% rows with matches, 5.58%
+matchless) is 0.8147. The floor behind that projection is the least certain
+number here -- it comes from a 400-row sample of the matchless population -- but
+the curve is flat between 0.20 and 0.40, so the choice is not load-bearing.
 
 ### Not yet completed
 
-The current code is a reproducible baseline, not the final leaderboard model.
-The following work remains before a competition-grade submission:
-
-1. Build a deterministic held-out validation runner over the full training
-   corpus.
-2. Measure candidate recall and candidate-set size for every blocking rule.
-3. Add character n-gram or approximate nearest-neighbor blocking.
-4. Generate hard negatives from ambiguous blocks.
-5. Train and calibrate a pair classifier using name, address, country, numeric
+1. Run full test inference and validate the outputs with
+   `validate_submission.py`.
+2. A char-n-gram or edit-distance retriever for the lexically unreachable
+   residual (see limitations).
+3. Train and calibrate a pair classifier using name, address, country, numeric
    token, and ambiguity features.
-6. Tune separate thresholds for Source 2 and Source 3 and for missing-address
+4. Tune separate thresholds for Source 2 and Source 3 and for missing-address
    cases.
-7. Add entity-level ambiguity and singleton guards.
-8. Run full test inference with the selected threshold policy.
-9. Validate final outputs with `validate_submission.py`.
-10. Fill in `Documentation_template.md` with measured validation results and
-    package the reproducible code and outputs.
+5. Fill in `Documentation_template.md` and package the submission.
 
-## Important limitations of the current baseline
+## Important limitations
 
-- Exact and selective token blocking can still miss heavily corrupted names,
-  transliterations, and records with incomplete addresses.
-- The current scorer is a deterministic heuristic, not a trained classifier.
-- The default threshold has not yet been selected using a full held-out
-  validation sweep.
-- The complete multi-million-row index build requires substantial time and disk
-  I/O. Runtime should be benchmarked on the target machine before final
-  submission.
-- No final test predictions are claimed by this README. Predictions should be
-  generated only after validation-based threshold selection.
+- **The residual recall gap is lexical, not configurational.** On a
+  force-included diagnostic pool every missed link is attributed to
+  `no_shared_term` -- the two records share no surviving indexed token at all
+  (mid-word corruption such as `Ibnovrtiosn` vs `Innovations`). No threshold or
+  budget change reaches those; only a fuzzy retriever would, and that is out of
+  scope under the stdlib-only constraint.
+- **The realistic-pool figures are measured at 1M records, not the ~10M test
+  corpus.** The postings budget and fraction-based stopword cap are both
+  designed to be scale-invariant, but that is a design argument, not a
+  measurement at full scale.
+- **The scorer is a deterministic heuristic, not a trained classifier.**
+- **The 300-candidate cap binds for 97% of rows** on the realistic pool (median
+  and mode are both exactly 300). So candidate-set size is not a tunable knob at
+  this density -- it is the cap -- and candidate recall depends entirely on the
+  ranking being right, not on the cap being generous. Raising the cap would buy
+  little recall and cost precision; the lever that matters is ranking quality.
+- No final test predictions are claimed by this README. The numbers above come
+  from a held-out training sample, shared with the scorer and threshold
+  selection, so they are mildly optimistic.
 
 ## Final submission layout
 
