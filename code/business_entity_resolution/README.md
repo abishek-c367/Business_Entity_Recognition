@@ -192,9 +192,10 @@ To improve recall for transliterated or domain-style business names, blocking
 also indexes the six longest informative address words and their pairwise
 combinations. This catches records whose names differ substantially while
 their addresses still overlap. To bound worst-case work from common ANN or
-token buckets, each ANN bucket contributes at most 100 rows and each
-selective block-key lookup contributes at most 75 rows. Exact name and address
-lookups remain uncapped.
+token buckets, the query-time budgets are distributed across the ANN buckets
+and selective block keys for each query row. Each retrieval keeps a minimum
+floor of 25 candidates per bucket/key to protect recall for sparse keys.
+Exact name and address lookups remain uncapped.
 
 On a deterministic 10,000-entity training sample, this address-pair extension
 increased macro candidate recall from 0.9571 to 0.9905. The same experiment

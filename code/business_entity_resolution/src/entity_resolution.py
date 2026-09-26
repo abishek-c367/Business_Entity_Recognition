@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import heapq
 import math
 import re
 import sqlite3
+import time
 import unicodedata
+import zlib
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -38,8 +41,10 @@ CHAR_NGRAM_MIN = 3
 CHAR_NGRAM_MAX = 5
 MINHASH_SIZE = 16
 LSH_BANDS = 4
-ANN_BUCKET_LIMIT = 100
-BLOCK_KEY_LIMIT = 75
+ANN_BUCKET_LIMIT = 500
+BLOCK_KEY_LIMIT = 250
+ANN_BUCKET_MIN_LIMIT = 100
+BLOCK_KEY_MIN_LIMIT = 25
 
 
 def normalize_text(value: str) -> str:
@@ -87,10 +92,13 @@ def character_ngrams(value: str) -> set[str]:
 
 
 def _hash_ngram(ngram: str, seed: int) -> int:
-    digest = hashlib.blake2b(
-        f"{seed}:{ngram}".encode("utf-8"), digest_size=8
-    ).digest()
-    return int.from_bytes(digest, "big")
+    # A non-cryptographic hash is sufficient here: this value only needs to
+    # spread n-grams roughly uniformly for bottom-k MinHash bucketing, not
+    # resist deliberate collision attacks. zlib.crc32 is a C-implemented
+    # stdlib function and is ~5x faster than blake2b in practice, which
+    # matters a great deal here because this function is called once per
+    # character n-gram per record (commonly 100+ times per record).
+    return zlib.crc32(f"{seed}:{ngram}".encode("utf-8"))
 
 
 def minhash_signature(ngrams: set[str]) -> tuple[int, ...]:
@@ -98,8 +106,11 @@ def minhash_signature(ngrams: set[str]) -> tuple[int, ...]:
         return (0,) * MINHASH_SIZE
     # Bottom-k MinHash uses one stable hash per n-gram and avoids a
     # permutations-by-document cost during the disk-backed index build.
-    values = sorted(_hash_ngram(ngram, 0) for ngram in ngrams)
-    return tuple(values[:MINHASH_SIZE] + [0] * (MINHASH_SIZE - len(values)))
+    # heapq.nsmallest is O(n log k) instead of a full O(n log n) sort --
+    # meaningful here since k=16 is typically far smaller than the number
+    # of n-grams in a record (often 100+).
+    values = heapq.nsmallest(MINHASH_SIZE, (_hash_ngram(ngram, 0) for ngram in ngrams))
+    return tuple(values + [0] * (MINHASH_SIZE - len(values)))
 
 
 def ann_bucket_keys(signature: tuple[int, ...]) -> tuple[str, ...]:
@@ -142,6 +153,15 @@ def connect_database(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=NORMAL")
+    # Default page cache is ~2MB, far smaller than the working set of these
+    # tables once the index holds hundreds of thousands to millions of rows
+    # (records + block_keys + ann_buckets + char_ngram_df all being written
+    # interleaved in the same batches). A larger cache and MEMORY temp store
+    # reduce disk I/O during the bulk load; mmap lets SQLite read pages
+    # directly instead of copying through its own page cache.
+    connection.execute("PRAGMA cache_size=-262144")  # ~256MB page cache
+    connection.execute("PRAGMA temp_store=MEMORY")
+    connection.execute("PRAGMA mmap_size=268435456")  # 256MB
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS records (
@@ -181,9 +201,6 @@ def connect_database(path: Path) -> sqlite3.Connection:
         """
     )
     connection.execute(
-        "CREATE INDEX IF NOT EXISTS ann_buckets_lookup ON ann_buckets(bucket_key, source, entity_id)"
-    )
-    connection.execute(
         """
         CREATE TABLE IF NOT EXISTS block_keys (
             block_key TEXT NOT NULL,
@@ -192,6 +209,33 @@ def connect_database(path: Path) -> sqlite3.Connection:
             PRIMARY KEY (block_key, entity_id)
         )
         """
+    )
+    # NOTE: the secondary (non-PRIMARY-KEY) lookup indexes are deliberately
+    # NOT created here -- see create_indexes() below and its call site in
+    # build_index(). Creating them up front forces every single insert
+    # during the bulk load to incrementally update every index's B-tree,
+    # which gets more expensive as each index grows (this is the classic
+    # SQLite "index-before-bulk-load" anti-pattern, and the ratio of rows
+    # to slowdown observed on real data -- much worse than linear -- is
+    # consistent with this being the dominant cost at real scale). The
+    # PRIMARY KEY constraints on entity_id / (block_key, entity_id) /
+    # (bucket_key, entity_id) still exist and are still enforced during the
+    # load (INSERT OR IGNORE / OR REPLACE rely on them) -- only the *extra*
+    # lookup indexes used by query-time candidate retrieval are deferred.
+    return connection
+
+
+def create_indexes(connection: sqlite3.Connection) -> None:
+    """Build the secondary lookup indexes once, after all rows are loaded.
+    A single bulk index build (SQLite sorts and builds the B-tree in one
+    pass) is dramatically cheaper than maintaining the same index
+    incrementally across hundreds of thousands of individual inserts."""
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS ann_buckets_lookup ON ann_buckets(bucket_key, source, entity_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS block_keys_lookup "
+        "ON block_keys(block_key, source, entity_id)"
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS records_name ON records(country, name_key)"
@@ -203,11 +247,6 @@ def connect_database(path: Path) -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS records_name_compact "
         "ON records(country, name_compact)"
     )
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS block_keys_lookup "
-        "ON block_keys(block_key, source, entity_id)"
-    )
-    return connection
 
 
 def build_index(source_paths: Iterable[Path], database_path: Path) -> None:
@@ -217,6 +256,16 @@ def build_index(source_paths: Iterable[Path], database_path: Path) -> None:
     connection.execute("DELETE FROM block_keys")
     connection.execute("DELETE FROM ann_buckets")
     connection.execute("DELETE FROM char_ngram_df")
+    # Explicitly drop the secondary lookup indexes even if this database
+    # file was already built by an older version of this script (or an
+    # earlier, interrupted run) that created them up front. Without this,
+    # reusing an existing database file would silently fall back to
+    # incremental (slow) index maintenance during the bulk load below.
+    for index_name in (
+        "ann_buckets_lookup", "block_keys_lookup",
+        "records_name", "records_address", "records_name_compact",
+    ):
+        connection.execute(f"DROP INDEX IF EXISTS {index_name}")
     connection.commit()
     insert_sql = """
         INSERT OR REPLACE INTO records (
@@ -229,6 +278,7 @@ def build_index(source_paths: Iterable[Path], database_path: Path) -> None:
     try:
         for source_path in source_paths:
             rows = []
+            ann_rows_pending = []  # (entity_id, bucket_key, source) precomputed once per row
             ngram_counts: defaultdict[str, int] = defaultdict(int)
             source = source_path.stem.split("_", 1)[1]
             for row in iter_rows(source_path):
@@ -238,9 +288,15 @@ def build_index(source_paths: Iterable[Path], database_path: Path) -> None:
                 ngrams = character_ngrams(search_key)
                 for ngram in ngrams:
                     ngram_counts[ngram] += 1
+                # Computed once here and reused below -- this used to be
+                # recomputed from scratch a second time per row when the
+                # ANN batch was flushed, doubling n-gram + minhash cost.
+                entity_id = row["entity_id"]
+                for bucket in ann_bucket_keys(minhash_signature(ngrams)):
+                    ann_rows_pending.append((bucket, entity_id, source))
                 rows.append(
                     (
-                        row["entity_id"],
+                        entity_id,
                         source,
                         row["business_name"],
                         row["business_address"],
@@ -262,16 +318,7 @@ def build_index(source_paths: Iterable[Path], database_path: Path) -> None:
                             for key in block_keys(name_key, address_key)
                         ],
                     )
-                    connection.executemany(
-                        ann_sql,
-                        [
-                            (key, entity_id, source)
-                            for entity_id, _, _, _, _, name_key, address_key, _, _, _ in rows
-                            for key in ann_bucket_keys(minhash_signature(
-                                character_ngrams(search_text(name_key, address_key))
-                            ))
-                        ],
-                    )
+                    connection.executemany(ann_sql, ann_rows_pending)
                     connection.executemany(
                         "INSERT INTO char_ngram_df VALUES (?, ?) "
                         "ON CONFLICT(ngram) DO UPDATE SET document_frequency = "
@@ -280,6 +327,7 @@ def build_index(source_paths: Iterable[Path], database_path: Path) -> None:
                     )
                     connection.commit()
                     rows.clear()
+                    ann_rows_pending.clear()
                     ngram_counts.clear()
             if rows:
                 connection.executemany(insert_sql, rows)
@@ -291,16 +339,7 @@ def build_index(source_paths: Iterable[Path], database_path: Path) -> None:
                         for key in block_keys(name_key, address_key)
                     ],
                 )
-                connection.executemany(
-                    ann_sql,
-                    [
-                        (key, entity_id, source)
-                        for entity_id, _, _, _, _, name_key, address_key, _, _, _ in rows
-                        for key in ann_bucket_keys(minhash_signature(
-                            character_ngrams(search_text(name_key, address_key))
-                        ))
-                    ],
-                )
+                connection.executemany(ann_sql, ann_rows_pending)
                 connection.executemany(
                     "INSERT INTO char_ngram_df VALUES (?, ?) "
                     "ON CONFLICT(ngram) DO UPDATE SET document_frequency = "
@@ -308,6 +347,13 @@ def build_index(source_paths: Iterable[Path], database_path: Path) -> None:
                     ngram_counts.items(),
                 )
                 connection.commit()
+                ann_rows_pending.clear()
+        # All rows are loaded now -- build the secondary lookup indexes in
+        # one bulk pass instead of incrementally during every insert above.
+        t_index = time.time()
+        create_indexes(connection)
+        connection.commit()
+        print(f"  (secondary indexes built in {time.time() - t_index:.1f}s)")
         connection.execute("ANALYZE")
         connection.commit()
     finally:
@@ -336,6 +382,13 @@ def block_keys(name_key: str, address_key: str) -> set[str]:
     if name_tokens and address_tokens:
         keys.add(f"na:{name_tokens[0]}:{min(address_tokens)}")
     return keys
+
+
+def adaptive_limit(total_limit: int, key_count: int, minimum: int) -> int:
+    """Distribute a retrieval budget while protecting sparse-key recall."""
+    if key_count <= 0:
+        return minimum
+    return max(minimum, (total_limit + key_count - 1) // key_count)
 
 
 def _similarity(left: str, right: str) -> float:
@@ -393,6 +446,9 @@ def candidate_rows(
     for query, parameters in queries:
         for candidate in connection.execute(query, parameters):
             candidates[candidate[0]] = candidate
+    ann_limit = adaptive_limit(
+        ANN_BUCKET_LIMIT, len(query_buckets), ANN_BUCKET_MIN_LIMIT
+    )
     for bucket in query_buckets:
         for candidate in connection.execute(
             "SELECT r.entity_id, r.business_name, r.business_address, "
@@ -400,17 +456,21 @@ def candidate_rows(
             "ON r.entity_id = b.entity_id WHERE b.bucket_key = ? "
             "AND b.source IN ('source2', 'source3') AND r.country = ? "
             "ORDER BY b.entity_id LIMIT ?",
-            (bucket, country, ANN_BUCKET_LIMIT),
+            (bucket, country, ann_limit),
         ):
             candidates[candidate[0]] = candidate
-    for key in block_keys(name_key, address_key):
+    query_block_keys = block_keys(name_key, address_key)
+    block_limit = adaptive_limit(
+        BLOCK_KEY_LIMIT, len(query_block_keys), BLOCK_KEY_MIN_LIMIT
+    )
+    for key in query_block_keys:
         for candidate in connection.execute(
             "SELECT r.entity_id, r.business_name, r.business_address, "
             "r.country, r.source FROM block_keys b JOIN records r "
             "ON r.entity_id = b.entity_id WHERE b.block_key = ? "
             "AND b.source IN ('source2', 'source3') AND r.country = "
             "? ORDER BY b.entity_id LIMIT ?",
-            (key, country, BLOCK_KEY_LIMIT),
+            (key, country, block_limit),
         ):
             candidates[candidate[0]] = candidate
     return [

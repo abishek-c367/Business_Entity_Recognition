@@ -130,6 +130,164 @@ def _init_sweep_worker(context) -> None:
 
 
 # --------------------------------------------------------------------------
+# Recall-pass worker: parallelizes attributed_candidates() across rows.
+# Each worker opens its OWN sqlite connection (read-only) -- sqlite
+# connections must not be shared across processes -- and only returns
+# small, aggregated per-row results (never the full candidate set) to keep
+# inter-process pickling cheap even when candidate sets are large.
+# --------------------------------------------------------------------------
+
+_RECALL_CONTEXT = None
+
+
+def _init_recall_worker(context) -> None:
+    global _RECALL_CONTEXT
+    _RECALL_CONTEXT = context
+
+
+def chunk_list(items: List, n_chunks: int) -> List[List]:
+    n_chunks = max(1, n_chunks)
+    size = max(1, -(-len(items) // n_chunks))  # ceil division
+    chunks = [items[i:i + size] for i in range(0, len(items), size)]
+    return chunks or [[]]
+
+
+def _recall_chunk(chunk: List[Tuple[dict, str]]) -> List[dict]:
+    er, db_path, labels = _RECALL_CONTEXT
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        results = []
+        for row, sid in chunk:
+            true_set = labels.get(sid, set())
+            mechanisms = attributed_candidates(er, connection, row)
+            combined = set(mechanisms)
+            hit = combined & true_set
+            group_hit = {}
+            for group, tags in MECHANISM_GROUPS.items():
+                group_candidates = {eid for eid, m in mechanisms.items() if m & tags}
+                group_hit[group] = bool(group_candidates & true_set)
+            results.append({
+                "sid": sid,
+                "true_count": len(true_set),
+                "candidate_count": len(combined),
+                "hit_count": len(hit),
+                # Only the DELTA is returned, not the full candidate set --
+                # true_set is small (a handful of ids at most), so this stays
+                # cheap to pickle even though `combined` can be large.
+                "missed_ids": sorted(true_set - combined),
+                "group_hit_combined": bool(hit) if true_set else False,
+                "group_hit_exact_any": group_hit["exact_any"] if true_set else False,
+                "group_hit_ann_lsh": group_hit["ann_lsh"] if true_set else False,
+                "group_hit_selective_block_key": group_hit["selective_block_key"] if true_set else False,
+            })
+        return results
+    finally:
+        connection.close()
+
+
+def run_recall_pass(
+    er, db_path: Path, source1_rows: List[dict], source1_ids: List[str],
+    labels: Dict[str, Set[str]], workers: int,
+) -> List[dict]:
+    """Runs attributed_candidates() over every sampled Source-1 row, in
+    parallel across `workers` processes if requested. Returns one small dict
+    per row (see _recall_chunk above) -- never the full candidate sets, to
+    keep this cheap even at 100k+ rows with hundreds of candidates each."""
+    pairs = list(zip(source1_rows, source1_ids))
+    if workers <= 1:
+        _init_recall_worker((er, str(db_path), labels))
+        chunks = chunk_list(pairs, 1)
+        return [item for chunk in chunks for item in _recall_chunk(chunk)]
+    chunks = chunk_list(pairs, workers * 4)
+    context_manager = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
+    with context_manager.Pool(processes=workers, initializer=_init_recall_worker,
+                               initargs=((er, str(db_path), labels),)) as pool:
+        chunk_results = pool.map(_recall_chunk, chunks)
+    return [item for chunk in chunk_results for item in chunk]
+
+
+# --------------------------------------------------------------------------
+# Miss diagnosis: for every Source-1 record that missed at least one true
+# target, figure out WHY that specific target wasn't retrieved. This only
+# runs over the (typically small) set of actual misses, so it stays cheap
+# even though it does a few extra targeted queries per miss.
+# --------------------------------------------------------------------------
+
+def diagnose_misses(
+    er, db_path: Path, miss_rows: List[Tuple[dict, str, List[str]]],
+) -> List[dict]:
+    """miss_rows: list of (source1_row, source1_id, missed_target_ids)."""
+    connection = sqlite3.connect(db_path)
+    diagnoses = []
+    for row, sid, missed_ids in miss_rows:
+        name_key = er.normalize_name(row["business_name"])
+        address_key = er.normalize_address(row["business_address"])
+        query_search_key = er.search_text(name_key, address_key)
+        query_ngrams = er.character_ngrams(query_search_key)
+        query_buckets = set(er.ann_bucket_keys(er.minhash_signature(query_ngrams)))
+        query_block_keys = set(er.block_keys(name_key, address_key))
+
+        for target_id in missed_ids:
+            target = connection.execute(
+                "SELECT business_name, business_address, country, source "
+                "FROM records WHERE entity_id = ?",
+                (target_id,),
+            ).fetchone()
+            if target is None:
+                diagnoses.append({
+                    "source1_entity_id": sid, "missed_target_id": target_id,
+                    "reason": "target_not_in_sampled_index",
+                    "country_mismatch": "", "ann_bucket_truncated": "",
+                    "block_key_truncated": "",
+                })
+                continue
+            target_name, target_address, target_country, target_source = target
+
+            country_mismatch = row["country"] != target_country
+
+            # Was this target actually IN one of the query's LSH buckets,
+            # just excluded by the ANN_BUCKET_LIMIT cap on the query side?
+            ann_truncated = False
+            if not country_mismatch and query_buckets:
+                placeholders = ",".join("?" for _ in query_buckets)
+                found = connection.execute(
+                    f"SELECT 1 FROM ann_buckets WHERE entity_id = ? "
+                    f"AND bucket_key IN ({placeholders}) LIMIT 1",
+                    (target_id, *query_buckets),
+                ).fetchone()
+                ann_truncated = bool(found)
+
+            # Same check for selective block keys.
+            block_key_truncated = False
+            if not country_mismatch and query_block_keys:
+                placeholders = ",".join("?" for _ in query_block_keys)
+                found = connection.execute(
+                    f"SELECT 1 FROM block_keys WHERE entity_id = ? "
+                    f"AND block_key IN ({placeholders}) LIMIT 1",
+                    (target_id, *query_block_keys),
+                ).fetchone()
+                block_key_truncated = bool(found)
+
+            if country_mismatch:
+                reason = "country_mismatch"
+            elif ann_truncated or block_key_truncated:
+                reason = "truncated_by_limit"
+            else:
+                reason = "no_mechanism_overlap"
+
+            diagnoses.append({
+                "source1_entity_id": sid,
+                "missed_target_id": target_id,
+                "reason": reason,
+                "country_mismatch": country_mismatch,
+                "ann_bucket_truncated": ann_truncated,
+                "block_key_truncated": block_key_truncated,
+            })
+    connection.close()
+    return diagnoses
+
+
+# --------------------------------------------------------------------------
 # Streaming sampling helpers (single pass, O(sample size) memory -- safe for
 # multi-million-row files)
 # --------------------------------------------------------------------------
@@ -293,22 +451,29 @@ def attributed_candidates(er, connection: sqlite3.Connection, row: dict) -> Dict
             (country, address_key),
         ):
             mechanisms[eid].add("exact_address")
+    ann_limit = er.adaptive_limit(
+        er.ANN_BUCKET_LIMIT, len(query_buckets), er.ANN_BUCKET_MIN_LIMIT
+    )
     for bucket in query_buckets:
         for (eid,) in connection.execute(
             "SELECT r.entity_id FROM ann_buckets b JOIN records r "
             "ON r.entity_id = b.entity_id WHERE b.bucket_key = ? "
             "AND b.source IN ('source2', 'source3') AND r.country = ? "
             "ORDER BY b.entity_id LIMIT ?",
-            (bucket, country, er.ANN_BUCKET_LIMIT),
+            (bucket, country, ann_limit),
         ):
             mechanisms[eid].add("ann_lsh")
-    for key in er.block_keys(name_key, address_key):
+    query_block_keys = er.block_keys(name_key, address_key)
+    block_limit = er.adaptive_limit(
+        er.BLOCK_KEY_LIMIT, len(query_block_keys), er.BLOCK_KEY_MIN_LIMIT
+    )
+    for key in query_block_keys:
         for (eid,) in connection.execute(
             "SELECT r.entity_id FROM block_keys b JOIN records r "
             "ON r.entity_id = b.entity_id WHERE b.block_key = ? "
             "AND b.source IN ('source2', 'source3') AND r.country = "
             "? ORDER BY b.entity_id LIMIT ?",
-            (key, country, er.BLOCK_KEY_LIMIT),
+            (key, country, block_limit),
         ):
             mechanisms[eid].add("selective_block_key")
     return mechanisms
@@ -335,6 +500,8 @@ def run_index_variant(
     source3_rows: List[dict],
     work_dir: Path,
     progress_every: int,
+    workers: int = 1,
+    skip_miss_diagnosis: bool = False,
 ) -> dict:
     """Build one production index and measure candidate
     recall + mechanism attribution against it."""
@@ -357,7 +524,13 @@ def run_index_variant(
     stored_sources = sorted(
         r[0] for r in connection.execute("SELECT DISTINCT source FROM records")
     )
+    connection.close()
     print(f"[{variant_name}] distinct `source` values actually stored: {stored_sources}")
+
+    t0 = time.time()
+    row_results = run_recall_pass(er, db_path, source1_rows, source1_ids, labels, workers)
+    print(f"[{variant_name}] recall pass over {len(source1_rows):,} rows done in "
+          f"{time.time() - t0:.1f}s ({workers} worker(s))")
 
     per_entity_recall: List[float] = []
     micro_true_positive = 0
@@ -366,44 +539,52 @@ def run_index_variant(
     candidate_sizes_singleton: List[int] = []
     group_recall_hits = {group: 0 for group in MECHANISM_GROUPS}
     group_recall_hits["combined"] = 0
-
+    n_zero_hit = n_partial_hit = n_full_hit = 0
     per_entity_rows_for_csv = []
+    # (source1_row, source1_id, missed_target_ids) for rows with >=1 miss --
+    # the input to the bounded miss-diagnosis pass below.
+    miss_inputs: List[Tuple[dict, str, List[str]]] = []
+    row_by_id = dict(zip(source1_ids, source1_rows))
 
-    t0 = time.time()
-    for i, (row, sid) in enumerate(zip(source1_rows, source1_ids)):
-        true_set = labels.get(sid, set())
-        mechanisms = attributed_candidates(er, connection, row)
-        combined_candidates = set(mechanisms)
+    for result in row_results:
+        sid = result["sid"]
+        true_count = result["true_count"]
+        candidate_count = result["candidate_count"]
+        hit_count = result["hit_count"]
+        missed_ids = result["missed_ids"]
 
-        if true_set:
-            candidate_sizes_matched.append(len(combined_candidates))
+        if true_count:
+            candidate_sizes_matched.append(candidate_count)
         else:
-            candidate_sizes_singleton.append(len(combined_candidates))
+            candidate_sizes_singleton.append(candidate_count)
 
-        if true_set:
-            hit = combined_candidates & true_set
-            recall = len(hit) / len(true_set)
+        if true_count:
+            recall = hit_count / true_count
             per_entity_recall.append(recall)
-            micro_true_positive += len(hit)
-            micro_true_total += len(true_set)
-            if hit:
+            micro_true_positive += hit_count
+            micro_true_total += true_count
+            if result["group_hit_combined"]:
                 group_recall_hits["combined"] += 1
-            for group, tags in MECHANISM_GROUPS.items():
-                group_candidates = {eid for eid, m in mechanisms.items() if m & tags}
-                if group_candidates & true_set:
-                    group_recall_hits[group] += 1
+            if result["group_hit_exact_any"]:
+                group_recall_hits["exact_any"] += 1
+            if result["group_hit_ann_lsh"]:
+                group_recall_hits["ann_lsh"] += 1
+            if result["group_hit_selective_block_key"]:
+                group_recall_hits["selective_block_key"] += 1
+
+            if hit_count == 0:
+                n_zero_hit += 1
+            elif hit_count < true_count:
+                n_partial_hit += 1
+            else:
+                n_full_hit += 1
+
+        if missed_ids:
+            miss_inputs.append((row_by_id[sid], sid, missed_ids))
 
         per_entity_rows_for_csv.append(
-            (sid, len(true_set), len(combined_candidates), len(true_set & combined_candidates))
+            (sid, true_count, candidate_count, hit_count, ",".join(missed_ids))
         )
-
-        if (i + 1) % progress_every == 0:
-            elapsed = time.time() - t0
-            rate = (i + 1) / elapsed if elapsed else 0
-            print(f"[{variant_name}] {i + 1:,}/{len(source1_rows):,} rows "
-                  f"({rate:.0f} rows/s)")
-
-    connection.close()
 
     matched_entity_count = len(per_entity_recall)
     macro_recall = statistics.mean(per_entity_recall) if per_entity_recall else float("nan")
@@ -414,8 +595,26 @@ def run_index_variant(
     csv_path = variant_dir / "per_entity_candidate_recall.csv"
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["source1_entity_id", "true_match_count", "candidate_count", "hits"])
+        writer.writerow(["source1_entity_id", "true_match_count", "candidate_count",
+                          "hits", "missed_target_ids"])
         writer.writerows(per_entity_rows_for_csv)
+
+    miss_reason_counts = {}
+    if not skip_miss_diagnosis and miss_inputs:
+        t0 = time.time()
+        diagnoses = diagnose_misses(er, db_path, miss_inputs)
+        print(f"[{variant_name}] diagnosed {len(diagnoses):,} individual misses "
+              f"across {len(miss_inputs):,} entities in {time.time() - t0:.1f}s")
+        diag_csv_path = variant_dir / "missed_target_diagnostics.csv"
+        with diag_csv_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=[
+                "source1_entity_id", "missed_target_id", "reason",
+                "country_mismatch", "ann_bucket_truncated", "block_key_truncated",
+            ])
+            writer.writeheader()
+            writer.writerows(diagnoses)
+        for d in diagnoses:
+            miss_reason_counts[d["reason"]] = miss_reason_counts.get(d["reason"], 0) + 1
 
     return {
         "variant": variant_name,
@@ -429,6 +628,11 @@ def run_index_variant(
         "entities_with_any_hit_selective_block_key": group_recall_hits["selective_block_key"],
         "candidate_size_matched": summarize_sizes(candidate_sizes_matched),
         "candidate_size_singleton": summarize_sizes(candidate_sizes_singleton),
+        "n_zero_hit": n_zero_hit,
+        "n_partial_hit": n_partial_hit,
+        "n_full_hit": n_full_hit,
+        "miss_reason_counts": miss_reason_counts,
+        "total_missed_links": sum(len(m[2]) for m in miss_inputs),
         "s2_path": s2_path,
         "s3_path": s3_path,
         "db_path": db_path,
@@ -508,8 +712,15 @@ def _run_diagnostic() -> None:
                          default=[0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.88, 0.9, 0.95])
     parser.add_argument("--progress-every", type=int, default=10_000)
     parser.add_argument("--workers", type=int, default=1,
-                         help="Processes for threshold scoring after candidate "
+                         help="Processes used for BOTH the recall pass "
+                              "(attributed_candidates per row) and the "
+                              "threshold-sweep scoring after candidate "
                               "retrieval is cached (Linux supports fork).")
+    parser.add_argument("--skip-miss-diagnosis", action="store_true",
+                         help="Skip the per-miss country-mismatch / ANN-truncation "
+                              "/ block-key-truncation breakdown (recall numbers are "
+                              "unaffected either way -- this only skips the extra "
+                              "root-cause queries for the misses).")
     parser.add_argument("--skip-threshold-sweep", action="store_true",
                          help="Only measure candidate recall; skip the "
                               "precision/recall/F0.5 threshold sweep (much faster).")
@@ -598,6 +809,7 @@ def _run_diagnostic() -> None:
         result = run_index_variant(
             er, variant_name, source1_rows, source1_ids, labels,
             source2_rows, source3_rows, work_dir, args.progress_every,
+            workers=args.workers, skip_miss_diagnosis=args.skip_miss_diagnosis,
         )
         variant_results.append(result)
 
@@ -618,6 +830,18 @@ def _run_diagnostic() -> None:
               f"{result['entities_with_any_hit_selective_block_key']:,} / {result['matched_entity_count']:,}")
         print(f"  candidate-set size (true-match entities)  : {result['candidate_size_matched']}")
         print(f"  candidate-set size (true singletons)      : {result['candidate_size_singleton']}")
+        print(f"  entities with FULL hit (all true matches found)    : {result['n_full_hit']:,}")
+        print(f"  entities with PARTIAL hit (some but not all found) : {result['n_partial_hit']:,}")
+        print(f"  entities with ZERO hit (nothing found)              : {result['n_zero_hit']:,}")
+        if result["miss_reason_counts"]:
+            print(f"  missed target links: {result['total_missed_links']:,}, by likely cause:")
+            for reason, count in sorted(result["miss_reason_counts"].items(),
+                                         key=lambda kv: -kv[1]):
+                print(f"    {reason:<28s}: {count:,}")
+            print(f"  -> see {result['variant']}/missed_target_diagnostics.csv for the "
+                  f"full per-miss breakdown, and {result['variant']}/"
+                  f"per_entity_candidate_recall.csv (missed_target_ids column) "
+                  f"for which specific ids were missed per entity.")
 
     if not args.skip_threshold_sweep:
         print("\n" + "=" * 78)
