@@ -38,8 +38,8 @@ CHAR_NGRAM_MIN = 3
 CHAR_NGRAM_MAX = 5
 MINHASH_SIZE = 16
 LSH_BANDS = 4
-ANN_BUCKET_LIMIT = 500
-BLOCK_KEY_LIMIT = 500
+ANN_BUCKET_LIMIT = 100
+BLOCK_KEY_LIMIT = 75
 
 
 def normalize_text(value: str) -> str:
@@ -325,6 +325,14 @@ def block_keys(name_key: str, address_key: str) -> set[str]:
     keys = {f"n:{token}" for token in name_tokens[:2] if len(token) >= 4}
     numeric = {token for token in address_tokens if token.isdigit() and len(token) >= 2}
     keys.update(f"a:{token}" for token in numeric)
+    address_words = sorted(
+        (token for token in address_tokens if len(token) >= 5 and not token.isdigit()),
+        key=lambda token: (-len(token), token),
+    )
+    keys.update(f"a:{token}" for token in address_words[:6])
+    for index, left in enumerate(address_words[:6]):
+        for right in address_words[index + 1:6]:
+            keys.add(f"aa:{left}:{right}")
     if name_tokens and address_tokens:
         keys.add(f"na:{name_tokens[0]}:{min(address_tokens)}")
     return keys

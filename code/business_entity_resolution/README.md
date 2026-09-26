@@ -188,9 +188,19 @@ ANN results are unioned, remain country-aware, and are deduplicated before
 matching. The resulting candidate set is written to `candidate_pairs.tsv` for
 recall measurement and debugging.
 
-To bound worst-case work from common ANN or token buckets, each ANN bucket and
-selective block-key lookup contributes at most 500 rows. Exact name and address
+To improve recall for transliterated or domain-style business names, blocking
+also indexes the six longest informative address words and their pairwise
+combinations. This catches records whose names differ substantially while
+their addresses still overlap. To bound worst-case work from common ANN or
+token buckets, each ANN bucket contributes at most 100 rows and each
+selective block-key lookup contributes at most 75 rows. Exact name and address
 lookups remain uncapped.
+
+On a deterministic 10,000-entity training sample, this address-pair extension
+increased macro candidate recall from 0.9571 to 0.9905. The same experiment
+had a median candidate set of 193 and a 95th percentile of 466, so these are
+recall/size validation results rather than a guarantee for every full-corpus
+entity.
 
 ### 4. Conservative matching
 

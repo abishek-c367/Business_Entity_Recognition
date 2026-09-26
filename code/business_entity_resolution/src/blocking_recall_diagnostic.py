@@ -98,6 +98,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import contextlib
 import multiprocessing as mp
 import random
 import sqlite3
@@ -305,8 +306,9 @@ def attributed_candidates(er, connection: sqlite3.Connection, row: dict) -> Dict
         for (eid,) in connection.execute(
             "SELECT r.entity_id FROM block_keys b JOIN records r "
             "ON r.entity_id = b.entity_id WHERE b.block_key = ? "
-            "AND b.source IN ('source2', 'source3') AND r.country = ?",
-            (key, country),
+            "AND b.source IN ('source2', 'source3') AND r.country = "
+            "? ORDER BY b.entity_id LIMIT ?",
+            (key, country, er.BLOCK_KEY_LIMIT),
         ):
             mechanisms[eid].add("selective_block_key")
     return mechanisms
@@ -479,7 +481,7 @@ def run_threshold_sweep(
     return sorted(results)
 
 
-def main() -> None:
+def _run_diagnostic() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -489,6 +491,12 @@ def main() -> None:
                          help="Directory with entity_resolution.py / evaluate.py "
                               "(default: <student-resource-dir>/code/business_entity_resolution/src)")
     parser.add_argument("--work-dir", type=Path, default=Path("work/diagnostic_100k"))
+    parser.add_argument(
+        "--output-md",
+        type=Path,
+        default=None,
+        help="Markdown file for diagnostic output (default: <work-dir>/blocking_recall_diagnostic.md).",
+    )
     parser.add_argument("--source1-sample-size", type=int, default=100_000)
     parser.add_argument("--target-fill-size", type=int, default=100_000,
                          help="Total random distractor budget across Source 2 + "
@@ -627,6 +635,27 @@ def main() -> None:
                   f"macro_f05={best_f05:.6f}")
 
     print(f"\nPer-entity CSVs and sampled tsvs are under: {work_dir.resolve()}")
+
+
+def main() -> None:
+    work_dir = Path("work/diagnostic_100k")
+    output_md = None
+    arguments = sys.argv[1:]
+    for index, argument in enumerate(arguments):
+        if argument == "--work-dir" and index + 1 < len(arguments):
+            work_dir = Path(arguments[index + 1])
+        elif argument == "--output-md" and index + 1 < len(arguments):
+            output_md = Path(arguments[index + 1])
+
+    output_md = output_md or work_dir / "blocking_recall_diagnostic.md"
+    output_md.parent.mkdir(parents=True, exist_ok=True)
+    with output_md.open("w", encoding="utf-8") as report:
+        report.write("# Blocking Recall Diagnostic\n\n")
+        report.write("```text\n")
+        with contextlib.redirect_stdout(report):
+            _run_diagnostic()
+        report.write("```\n")
+    print(f"Diagnostic report written to: {output_md}", file=sys.stderr)
 
 
 if __name__ == "__main__":
